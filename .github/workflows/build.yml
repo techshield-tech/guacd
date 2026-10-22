@@ -32,7 +32,7 @@ env:
 
 jobs:
   resolve:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.resolve.outputs.version }}
       tags: ${{ steps.resolve.outputs.tags }}
@@ -119,6 +119,10 @@ jobs:
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
+          # Dockerfile upstream tự lấy tag mới nhất của dependency; libwebsockets v5 đổi
+          # TLS backend mặc định sang GnuTLS và không build được, nên ghim về dòng v4.
+          build-args: |
+            WITH_LIBWEBSOCKETS=v4\.\d+(\.\d+)+
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=guacd (Apache Guacamole server) ${{ needs.resolve.outputs.version }}
@@ -143,7 +147,7 @@ jobs:
 
   merge:
     needs: [resolve, build]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/download-artifact@v4
         with:
