@@ -119,10 +119,17 @@ jobs:
         with:
           context: .
           platforms: linux/${{ matrix.arch }}
-          # Dockerfile upstream tự lấy tag mới nhất của dependency; libwebsockets v5 đổi
-          # TLS backend mặc định sang GnuTLS và không build được, nên ghim về dòng v4.
+          # Dockerfile upstream tự lấy tag mới nhất của dependency:
+          # - libwebsockets v5 đổi TLS backend mặc định sang GnuTLS và không build được,
+          #   nên ghim về dòng v4.
+          # - Tag FreeRDP 2.11.8 (release chính thức) ghi nhầm version "2.11.8-dev", khiến
+          #   configure của guacamole-server từ chối; FreeRDP chỉ lấy tag release nên cho
+          #   phép bỏ qua kiểm tra này. Dùng *_X86_OPTS/*_ARM_OPTS để không ghi đè
+          #   GUACAMOLE_SERVER_OPTS mặc định của upstream.
           build-args: |
             WITH_LIBWEBSOCKETS=v4\.\d+(\.\d+)+
+            GUACAMOLE_SERVER_X86_OPTS=--enable-allow-freerdp-snapshots
+            GUACAMOLE_SERVER_ARM_OPTS=--enable-allow-freerdp-snapshots
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.description=guacd (Apache Guacamole server) ${{ needs.resolve.outputs.version }}
