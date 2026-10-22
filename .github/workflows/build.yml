@@ -1,0 +1,174 @@
+name: Build guacd
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Tag của apache/guacamole-server (để trống = bản stable mới nhất)"
+        required: false
+        default: ""
+      force:
+        description: "Build lại kể cả khi tag đã có trên GHCR"
+        type: boolean
+        default: false
+  schedule:
+    # Mỗi ngày 02:00 UTC kiểm tra upstream có release mới không
+    - cron: "0 2 * * *"
+  push:
+    branches: [main]
+    paths: [".github/workflows/build.yml"]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-guacd
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: apache/guacamole-server
+  IMAGE: ghcr.io/${{ github.repository_owner }}/guacd
+
+jobs:
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      tags: ${{ steps.resolve.outputs.tags }}
+      build: ${{ steps.resolve.outputs.build }}
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          # Chỉ lấy tag stable dạng X.Y.Z, sắp xếp theo semver
+          stable=$(gh api --paginate "repos/$UPSTREAM_REPO/tags?per_page=100" --jq '.[].name' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
+          latest=$(echo "$stable" | tail -n1)
+
+          version="${INPUT_VERSION:-$latest}"
+          if ! echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-RC[0-9]+)?$'; then
+            echo "::error::Version không hợp lệ: $version"; exit 1
+          fi
+          gh api "repos/$UPSTREAM_REPO/git/ref/tags/$version" > /dev/null
+
+          tags="$IMAGE:$version"
+          if echo "$stable" | grep -qx "$version"; then
+            minor="${version%.*}"
+            # Tag X.Y chỉ trỏ vào bản mới nhất của nhánh X.Y
+            if [ "$(echo "$stable" | grep "^${minor//./\\.}\." | tail -n1)" = "$version" ]; then
+              tags="$tags,$IMAGE:$minor"
+            fi
+            if [ "$version" = "$latest" ]; then
+              tags="$tags,$IMAGE:latest"
+            fi
+          fi
+
+          build=true
+          if [ "$INPUT_FORCE" != "true" ] && docker buildx imagetools inspect "$IMAGE:$version" > /dev/null 2>&1; then
+            echo "$IMAGE:$version đã tồn tại, bỏ qua."
+            build=false
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "### guacd $version → build=$build" >> "$GITHUB_STEP_SUMMARY"
+          echo "Tags: \`$tags\`" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    # Build native trên từng kiến trúc, không dùng QEMU (biên dịch FreeRDP qua QEMU rất chậm)
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM_REPO }}
+          ref: ${{ needs.resolve.outputs.version }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=guacd (Apache Guacamole server) ${{ needs.resolve.outputs.version }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.version }}
+            org.opencontainers.image.licenses=Apache-2.0
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [resolve, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - working-directory: /tmp/digests
+        env:
+          TAGS: ${{ needs.resolve.outputs.tags }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag_args=$(echo "$TAGS" | tr ',' '\n' | sed 's/^/-t /' | tr '\n' ' ')
+          docker buildx imagetools create $tag_args \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --annotation "index:org.opencontainers.image.description=guacd (Apache Guacamole server) $VERSION" \
+            --annotation "index:org.opencontainers.image.licenses=Apache-2.0" \
+            $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
